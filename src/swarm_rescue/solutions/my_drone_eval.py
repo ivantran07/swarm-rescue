@@ -1,5 +1,5 @@
 import random
-import math
+# import math
 from typing import Optional, List, Type
 from enum import Enum
 import numpy as np
@@ -210,17 +210,27 @@ class MyDroneEval(DroneAbstract):
     # to calculate map
     OCCUPIED_CERTAINTY_THRESHOLD = 0.99 # probability of being occupied (99% occupied)
     FREE_CERTAINTY_THRESHOLD = 1 - OCCUPIED_CERTAINTY_THRESHOLD # probablity of not being occupied (99% free = 1% occupied)
-    GRID_OCCUPIED_THRESHOLD = math.log(OCCUPIED_CERTAINTY_THRESHOLD) - math.log(1 - OCCUPIED_CERTAINTY_THRESHOLD) # using log-odds probability
+    GRID_OCCUPIED_THRESHOLD = np.log(OCCUPIED_CERTAINTY_THRESHOLD) - np.log(1 - OCCUPIED_CERTAINTY_THRESHOLD) # using log-odds probability
     GRID_FREE_THRESHOLD = -GRID_OCCUPIED_THRESHOLD
 
     # to calculate utility
     NUM_REGIONS = 5
 
     # to calculate distance
-    DISTANCE_THRESHOLD = 10
+    DISTANCE_THRESHOLD = 8
+    LIDAR_RANGE = 40
 
     # to calculate speed
     MAX_SPEED = 1
+    
+    # Control parameters
+    ROTATION_COEFF = 1 / np.pi
+    FORWARD_COEFF = 1
+    ANGULAR_THRESHOLD = np.pi / 180 * (10) # Angular error threshold (deg) for moving forward
+
+    # to calculate next target point
+    NUM_PARTITIONS = 10
+    PARTITION_DIST_THRESHOLD =  3
 
     def __init__(self,
                  identifier: Optional[int] = None, **kwargs):
@@ -245,6 +255,9 @@ class MyDroneEval(DroneAbstract):
                                   lidar=self.lidar())
         
         self.target = None
+
+        # meshgrid to evaluate utility of a possible target
+        self.MESH_XX, self.MESH_YY = np.meshgrid(np.arange(self.grid.y_max_grid), np.arange(self.grid.x_max_grid))
 
     def define_message_for_all(self):
         """
@@ -364,75 +377,136 @@ class MyDroneEval(DroneAbstract):
         obstacle is hit
         """
         pos = self.grid._conv_world_to_grid(*self.measured_gps_position())
-        angle = self.measured_compass_angle()
-        forward = 0
-        rotation = 0
+        # if self.iteration <= 75:
+        #     return {"forward": 0,
+        #             "rotation": 0.5}
 
-        if self.target is None or np.linalg.norm(self.target-pos) < self.DISTANCE_THRESHOLD:
-            # convert probabilities grid to binary grid
-            bin_grid = self.grid.grid.copy()
-            bin_grid[bin_grid <= self.GRID_FREE_THRESHOLD] = 0  # free
-            bin_grid[bin_grid >= self.GRID_OCCUPIED_THRESHOLD] = 1  # occupied
-            frontier = np.logical_and(bin_grid != 1, bin_grid != 0) # not explored yet as not sure if free or occupied
-            frontier_indices = np.nonzero(frontier)
+        if self.target is None or np.linalg.norm(self.target - pos) < self.DISTANCE_THRESHOLD:
+            occupancy_grid = self.grid.grid.copy()
+            # occupancy_grid[occupancy_grid <= self.GRID_FREE_THRESHOLD] = 0
+            # occupancy_grid[occupancy_grid >= self.GRID_OCCUPIED_THRESHOLD] = 1
+            # np.savetxt('map_complete.txt', self.grid.grid.copy(), fmt='%.2f', delimiter=' ')
+            # np.savetxt('map_occupied.txt', bin_grid >= self.GRID_OCCUPIED_THRESHOLD, fmt='%d', delimiter='')
+            frontier = np.logical_and(occupancy_grid < 0, occupancy_grid > self.GRID_FREE_THRESHOLD)
+            # np.savetxt('map_frontier.txt', frontier, fmt='%d', delimiter='')
+            frontier_pos = np.column_stack(np.nonzero(frontier))
+            # bin_grid[frontier] = 2
+            # np.savetxt('map_frontier.txt', frontier, fmt='%d', delimiter='')
+            centroids = self.partition_frontier(frontier_pos, self.NUM_PARTITIONS)
             
-            rand_point = random.choice(np.column_stack(frontier_indices))
-            self.target = rand_point
-            print(" NEW TARGET \n\n\n")
-            print(f"target {self.target}")
+            # bin_grid = np.zeros(shape=occupancy_grid.shape)
+            # bin_grid[frontier] = 1
+            # centroids_indices = np.transpose(np.rint(centroids).astype(int))
+            # bin_grid[*centroids_indices] = 2
+            # bin_grid[obstacles] = 3
+            # np.savetxt('map_centroids.txt', bin_grid, fmt='%d', delimiter='')
+            obstacles = occupancy_grid >= self.GRID_OCCUPIED_THRESHOLD
+            no_obstacles_in_path_to_target = np.array([self.verify_obstacles(obstacles, pos, centroid, 3) for centroid in centroids])
+            # print(no_obstacles_in_path_to_target)
+            if not np.any(no_obstacles_in_path_to_target):
+                command = {"forward": 0,
+                           "rotation": 0} 
+                return command 
+            filtered_centroids = np.array([centroids[i] for i in range(self.NUM_PARTITIONS) if no_obstacles_in_path_to_target[i]])
+            # print(filtered_centroids.shape)
+            # print(filtered_centroids)
 
-        else:
-            # Calculate target vector
-            target_vector = self.target - pos
-            
-            # Target angle and angular error
-            theta_t = np.arctan2(*target_vector)
-            delta_theta = (theta_t - angle + np.pi) % (2 * np.pi) - np.pi
-            
-            # Distance to the target
-            distance = np.linalg.norm(target_vector)
-            
-            # Control parameters
-            k_angular = 1.0
-            k_forward = 0.5
-            epsilon = 0.1  # Angular error threshold for moving forward
-            
-            # Compute actuator values
-            rotation = np.clip(k_angular * delta_theta, -1, 1)
-            forward = np.clip(k_forward * distance, -1, 1) if abs(delta_theta) < epsilon else 0
-            lateral_controller = 0  # No lateral movement
+            unexplored_points = occupancy_grid == 0
+            points_in_range = np.array([np.logical_and((self.MESH_XX - point[0])**2 + (self.MESH_YY - point[1])**2 <= (self.LIDAR_RANGE - 5)**2, unexplored_points) for point in filtered_centroids])
+            num_points_in_range = np.count_nonzero(points_in_range, axis=(1,2))
+            # print()
+            # print(num_points_in_range)
+
+            self.target = filtered_centroids[np.argmax(num_points_in_range)]
+            # print(f"pos: {pos} target: {self.target}")
+            command = {"forward": 0,
+                       "rotation": 0}
+            return command
+
+        command = self.move_to_target(pos, self.measured_compass_angle(), self.target)
+        return command
+
+    # implementation of k-means clustering
+    def partition_frontier(self, frontier_pos, num_regions):
+        # print(len(frontier_pos))
+        centroid_indices = np.random.choice(len(frontier_pos), size=num_regions, replace=False)
+        # print(centroid_indices)
+        centroids = frontier_pos[centroid_indices]
+        # print(centroids)
+        go = True
+        while go:
+            dist_to_centroids = np.array([[np.linalg.norm(centroid - point) for centroid in centroids] for point in frontier_pos])
+            closest_centroid = np.argmin(dist_to_centroids, axis=1)
+            new_centroids = np.array([np.mean(frontier_pos[closest_centroid == i], axis=0) for i in range(num_regions)])
+            # print(new_centroids)
+            change_in_pos = np.linalg.norm(new_centroids - centroids, axis=1)
+            if np.max(change_in_pos < self.PARTITION_DIST_THRESHOLD):
+                go = False
+            centroids = new_centroids.copy()
+        return centroids
+
+    # implementation of bresenham function (to get list of points in a line)
+    def get_points_in_path(self, obstacles_grid, pos, target):
+        x1, y1 = pos
+        x2, y2 = target
+        points = []
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        sx = 1 if x1 < x2 else -1
+        sy = 1 if y1 < y2 else -1
+        err = dx - dy
+        # print(pos, target)
+
+        while True:
+            if obstacles_grid[x1, y1]:
+                return False 
+            # print((x1, y1))
+            points.append((x1, y1))
+            if np.linalg.norm([y2 - y1, x2 - x1]) < 2:
+                break
+            err2 = err * 2
+            if err2 > -dy:
+                err -= dy
+                x1 += sx
+            if err2 < dx:
+                err += dx
+                y1 += sy
+        return points
     
-        return {"forward": forward,
-                "rotation": rotation}
+    def verify_obstacles(self, obstacles_grid, pos, target, thickness):
+        line_points = self.get_points_in_path(obstacles_grid, pos, target)
+        if not line_points:
+            return line_points
+        for (px, py) in line_points:
+            for dx in range(-thickness // 2, thickness // 2 + 1):
+                for dy in range(-thickness // 2, thickness // 2 + 1):
+                    if obstacles_grid[px + dx, py + dy]:
+                        return False
+        return True
 
-        #     target = rand_point
-        #     pos_u = pos / np.linalg.norm(pos)
-        #     target_u = target / np.linalg.norm(target)
-        #     target_angle = np.arccos(np.clip(np.dot(pos_u, target_u), -1.0, 1.0))
+    def determine_target(self, occupancy_grid, pos):
+        pass
 
-        #     self.target = target
-        #     self.target_u = target_u
-        #     self.target_angle = target_angle
-
-
-        # else:
-        #     pos_u = pos / np.linalg.norm(pos)
-        #     target_vector = self.target - pos
-        #     target_angle = np.arctan2(target_vector[1], target_vector[0])  # (dy, dx)
-
-        #     rotation = target_angle / 10 * np.pi
-        #     forward = min(np.linalg.norm(self.target - pos) / 50, self.MAX_SPEED)
+    def move_to_target(self, pos, orientation, target):
+        # Distance to the target
+        dist_to_target = np.linalg.norm(target - pos)
         
-        # command = {"forward": forward,
-        #            "rotation": rotation}
+        # Signed angle (positive = anti-clockwise) of rotation between drone's orientation and target 
+        target_vector = target - pos
+        drone_orientation = orientation
+        target_orientation_rel_to_drone = -np.arctan2(target_vector[1], target_vector[0])
+        angle_to_target = target_orientation_rel_to_drone - drone_orientation
 
-        # # command = {"forward": forward,
-        # #            "rotation": rotation}
-        # # if self.iteration % 75 == 0:
-        # #     np.savetxt('test.txt', frontier, fmt='%d')
-        # #     print(0/0)
+        # print(f"pos: {pos} target: {self.target} target_vector: {target_vector}")
+        # print(f"theta_1 (drone): {drone_orientation*180/np.pi}, theta_2 (target rel to drone): {target_orientation_rel_to_drone*180/np.pi}, signed angle: {angle_to_target*180/np.pi}")
 
-        # return command
+        # Compute actuator values
+        forward = np.clip(self.FORWARD_COEFF * dist_to_target, -1, 1) if abs(angle_to_target) < self.ANGULAR_THRESHOLD else 0
+        rotation = np.clip(self.ROTATION_COEFF * angle_to_target, -1, 1)
+
+        command = {"forward": forward,
+                   "rotation": rotation}
+        return command
 
     def process_semantic_sensor(self):
         """
